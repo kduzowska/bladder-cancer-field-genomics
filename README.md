@@ -82,4 +82,4 @@ Major software used across the workflows includes R, bcftools, ANNOVAR, Mutation
 
 ## Data availability
 
-The repository contains analysis code and configuration files. Patient-level sequencing, clinical, and other controlled-access data are not included in the public repository. Raw files are deposited in an EGA repository (...).
+The repository contains analysis code, without input files or results. Patient-level sequencing, clinical, and other controlled-access data are not included in the public repository. Raw files are deposited in an EGA repository (...).
