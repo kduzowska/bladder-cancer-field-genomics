@@ -2,7 +2,7 @@
 
 ### R | Bash | bcftools | PyClone-VI | ASCAT | MutationalPatterns | MoChA
 
-This repository contains code used for the genomic analyses described in the ... paper.
+This repository contains code used for the genomic analyses described in the **'Bladder cancer beyond the tumor: multi-site genomic profiling identifies recurrent alterations in FGFR signaling and chromatin regulators across the cancerized urothelial field'** paper (under revision).
 
 The project's main goal is the **analysis of histologically normal bladder tissues adjacent to tumors (NATs) on a genomic level**. By conducting this study we were primarily interested in determining to what extent is the bladder cancerized field altered on a copy number and single nucleotide variant level and if these alterations target specific genes or regions of the genome. We focused primarily on the somatic copy number alterations, clonal relationships between tumors and NATs, and mutational processes across the urothelial cancerized field.
 
