@@ -1,0 +1,855 @@
+# step8_cluster_mutational_signatures.R
+
+# Purpose:
+#   Characterize mutational signatures in shared, tumor-specific and
+#   NAT-specific PyClone-VI clonal compartments.
+
+# Analysis:
+#   - assign each mutation to its PyClone-VI clonal class
+#   - construct 96-channel SBS spectra per patient x clonal class
+#   - construct pooled spectra for each clonal class
+#   - fit selected COSMIC v3.2 SBS signatures using MutationalPatterns
+#   - calculate reconstruction cosine similarity
+#   - compare relative signature contributions between clonal classes
+#     using paired Wilcoxon signed-rank tests
+
+# Signature panel:
+#   Age-related: SBS1, SBS5, SBS40
+#   APOBEC:      SBS2, SBS13
+#   Tobacco:     SBS92
+
+# Predefined process-level scores:
+#   Age-related = SBS1 + SBS5 + SBS40
+#   APOBEC      = SBS2 + SBS13
+
+# 1. Packages
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(MutationalPatterns)
+  library(GenomicRanges)
+  library(IRanges)
+  library(GenomeInfoDb)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+})
+
+
+# 2. Paths
+
+PYCLONE_RESULTS <- "~/bladder-cancer-field-genomics/clonal_analysis_mutational_patterns/results/step6_pyclone_analysis/pyclone_all_results.tsv"
+CLUSTER_SUMMARY <- "~/bladder-cancer-field-genomics/clonal_analysis_mutational_patterns/results/step6_pyclone_analysis/pyclone_cluster_summary.tsv"
+OUT_DIR <- "~/bladder-cancer-field-genomics/clonal_analysis_mutational_patterns/results/step8_cluster_mut_sig"
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+
+# 3. Analysis settings
+
+REF_GENOME <- BSgenome.Hsapiens.UCSC.hg38
+COSMIC_SOURCE <- "COSMIC_v3.2"
+REFERENCE_GENOME <- "GRCh38"
+MAX_DELTA <- 0.004
+
+SIGNATURE_PANEL <- c(
+  "SBS1", "SBS5", "SBS40",
+  "SBS2", "SBS13",
+  "SBS92"
+)
+
+AGE_RELATED_SIGNATURES <- c("SBS1", "SBS5", "SBS40")
+APOBEC_SIGNATURES <- c("SBS2", "SBS13")
+
+CLASS_LEVELS <- c(
+  "shared",
+  "tumor_specific",
+  "NAT_specific"
+)
+
+STD_CHR <- paste0("chr", c(1:22, "X", "Y"))
+
+
+# 4. Helper functions
+
+confidence_from_count <- function(n) {
+  dplyr::case_when(
+    n > 100 ~ "high",
+    n >= 50 ~ "medium",
+    n >= 1 ~ "low",
+    TRUE ~ "no_mutations"
+  )
+}
+
+
+cosine_similarity <- function(a, b) {
+  if (sum(a) == 0 || sum(b) == 0) return(NA_real_)
+  sum(a * b) / (sqrt(sum(a^2)) * sqrt(sum(b^2)))
+}
+
+
+make_granges <- function(tb) {
+  gr <- GenomicRanges::GRanges(
+    seqnames = tb$chr,
+    ranges = IRanges::IRanges(start = tb$pos, end = tb$pos),
+    REF = tb$ref,
+    ALT = tb$alt
+  )
+  
+  GenomeInfoDb::genome(gr) <- "hg38"
+  gr
+}
+
+
+write_matrix_tsv <- function(mat, path) {
+  out <- as.data.frame(mat, check.names = FALSE) %>%
+    tibble::rownames_to_column("context")
+  
+  readr::write_tsv(out, path)
+}
+
+
+# 5. Validate input files
+
+if (!file.exists(PYCLONE_RESULTS)) {
+  stop("PyClone mutation-level results not found: ", PYCLONE_RESULTS, call. = FALSE)
+}
+
+if (!file.exists(CLUSTER_SUMMARY)) {
+  stop("PyClone cluster summary not found: ", CLUSTER_SUMMARY, call. = FALSE)
+}
+
+
+# 6. Load PyClone mutation-level results
+
+pyclone <- readr::read_tsv(
+  PYCLONE_RESULTS,
+  col_types = readr::cols(.default = "c"),
+  show_col_types = FALSE
+)
+
+required_results <- c("patient", "mutation_id", "cluster_id")
+missing_results <- setdiff(required_results, names(pyclone))
+
+if (length(missing_results) > 0) {
+  stop(
+    "pyclone_all_results.tsv is missing column(s): ",
+    paste(missing_results, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+pyclone <- pyclone %>%
+  dplyr::mutate(
+    patient = stringr::str_trim(patient),
+    mutation_id = stringr::str_trim(mutation_id),
+    cluster_id = suppressWarnings(as.integer(cluster_id))
+  )
+
+mutation_clusters <- pyclone %>%
+  dplyr::distinct(patient, mutation_id, cluster_id)
+
+mutation_cluster_check <- mutation_clusters %>%
+  dplyr::count(patient, mutation_id, name = "n_clusters") %>%
+  dplyr::filter(n_clusters != 1L)
+
+if (nrow(mutation_cluster_check) > 0) {
+  print(mutation_cluster_check)
+  stop("At least one mutation is assigned to more than one cluster.", call. = FALSE)
+}
+
+
+# 7. Load cluster classifications
+
+clusters <- readr::read_tsv(
+  CLUSTER_SUMMARY,
+  col_types = readr::cols(.default = "c"),
+  show_col_types = FALSE
+)
+
+required_clusters <- c(
+  "patient",
+  "cluster_id",
+  "classification",
+  "n_mutations",
+  "high_confidence_cluster"
+)
+
+missing_clusters <- setdiff(required_clusters, names(clusters))
+
+if (length(missing_clusters) > 0) {
+  stop(
+    "pyclone_cluster_summary.tsv is missing column(s): ",
+    paste(missing_clusters, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+clusters <- clusters %>%
+  dplyr::mutate(
+    patient = stringr::str_trim(patient),
+    cluster_id = suppressWarnings(as.integer(cluster_id)),
+    classification = stringr::str_trim(classification),
+    n_cluster_mutations = suppressWarnings(as.integer(n_mutations)),
+    high_confidence_cluster = stringr::str_to_lower(high_confidence_cluster) == "true"
+  ) %>%
+  dplyr::select(
+    patient,
+    cluster_id,
+    classification,
+    n_cluster_mutations,
+    high_confidence_cluster
+  )
+
+if (anyDuplicated(clusters[c("patient", "cluster_id")])) {
+  stop("Duplicated patient x cluster entries detected.", call. = FALSE)
+}
+
+# 8. Assign mutations to clonal classes
+
+muts_all <- mutation_clusters %>%
+  dplyr::left_join(clusters, by = c("patient", "cluster_id"))
+
+missing_classification <- muts_all %>%
+  dplyr::filter(is.na(classification))
+
+if (nrow(missing_classification) > 0) {
+  print(head(missing_classification, 20))
+  stop("Some mutations could not be matched to a cluster classification.", call. = FALSE)
+}
+
+excluded_class_counts <- muts_all %>%
+  dplyr::filter(!classification %in% CLASS_LEVELS) %>%
+  dplyr::count(classification, name = "n_mutations")
+
+if (nrow(excluded_class_counts) > 0) {
+  cat("\nMutations excluded from signature analysis because their clusters are not in the three analysis classes:\n")
+  print(excluded_class_counts)
+}
+
+muts <- muts_all %>%
+  dplyr::filter(classification %in% CLASS_LEVELS)
+
+
+# 9. Parse genomic coordinates
+
+muts <- muts %>%
+  tidyr::separate(
+    mutation_id,
+    into = c("chr", "pos", "ref", "alt"),
+    sep = ":",
+    remove = FALSE,
+    convert = FALSE
+  ) %>%
+  dplyr::mutate(
+    chr = stringr::str_trim(chr),
+    chr = dplyr::if_else(stringr::str_detect(chr, "^chr"), chr, paste0("chr", chr)),
+    pos = suppressWarnings(as.integer(pos)),
+    ref = stringr::str_to_upper(stringr::str_trim(ref)),
+    alt = stringr::str_to_upper(stringr::str_trim(alt))
+  )
+
+bad_variants <- muts %>%
+  dplyr::filter(
+    is.na(pos) | pos < 1L |
+      !chr %in% STD_CHR |
+      !ref %in% c("A", "C", "G", "T") |
+      !alt %in% c("A", "C", "G", "T") |
+      nchar(ref) != 1L |
+      nchar(alt) != 1L |
+      ref == alt
+  )
+
+if (nrow(bad_variants) > 0) {
+  print(head(bad_variants, 20))
+  stop("Malformed or non-SNV mutation IDs detected.", call. = FALSE)
+}
+
+muts <- muts %>%
+  dplyr::mutate(
+    classification = factor(classification, levels = CLASS_LEVELS)
+  ) %>%
+  dplyr::arrange(patient, classification, chr, pos)
+
+readr::write_tsv(
+  muts %>%
+    dplyr::select(
+      patient,
+      mutation_id,
+      cluster_id,
+      classification,
+      n_cluster_mutations,
+      high_confidence_cluster,
+      chr,
+      pos,
+      ref,
+      alt
+    ),
+  file.path(OUT_DIR, "cluster_signature_mutations.tsv")
+)
+
+
+# 10. Define patient x clonal-class profiles
+
+profile_meta <- muts %>%
+  dplyr::count(patient, classification, name = "n_snvs") %>%
+  dplyr::mutate(
+    profile_id = paste(patient, classification, sep = "__"),
+    confidence = confidence_from_count(n_snvs)
+  ) %>%
+  dplyr::select(profile_id, patient, classification, n_snvs, confidence)
+
+muts <- muts %>%
+  dplyr::mutate(profile_id = paste(patient, classification, sep = "__"))
+
+cat("\nPatient x clonal-class spectra:", nrow(profile_meta), "\n")
+print(table(profile_meta$confidence))
+
+
+# 11. Build patient x clonal-class 96-channel matrix
+
+patient_lists <- muts %>%
+  split(.$profile_id) %>%
+  purrr::map(make_granges)
+
+patient_grl <- GenomicRanges::GRangesList(patient_lists)
+
+mut_mat_patient <- MutationalPatterns::mut_matrix(
+  vcf_list = patient_grl,
+  ref_genome = REF_GENOME
+)
+
+if (nrow(mut_mat_patient) != 96) {
+  stop("Patient x class mutation matrix does not contain 96 SBS contexts.", call. = FALSE)
+}
+
+write_matrix_tsv(
+  mut_mat_patient,
+  file.path(OUT_DIR, "cluster_signature_96_matrix_patient_class.tsv")
+)
+
+# 12. Build pooled clonal-class 96-channel matrix
+
+missing_pooled_classes <- setdiff(CLASS_LEVELS, as.character(unique(muts$classification)))
+
+if (length(missing_pooled_classes) > 0) {
+  stop(
+    "No mutations were available for pooled class(es): ",
+    paste(missing_pooled_classes, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+pooled_lists <- setNames(
+  lapply(CLASS_LEVELS, function(cl) {
+    make_granges(muts %>% dplyr::filter(classification == cl))
+  }),
+  CLASS_LEVELS
+)
+
+pooled_grl <- GenomicRanges::GRangesList(pooled_lists)
+
+mut_mat_pooled <- MutationalPatterns::mut_matrix(
+  vcf_list = pooled_grl,
+  ref_genome = REF_GENOME
+)
+
+if (nrow(mut_mat_pooled) != 96) {
+  stop("Pooled mutation matrix does not contain 96 SBS contexts.", call. = FALSE)
+}
+
+write_matrix_tsv(
+  mut_mat_pooled,
+  file.path(OUT_DIR, "cluster_signature_96_matrix_pooled.tsv")
+)
+
+# 13. Load COSMIC v3.2 reference signatures
+
+all_signatures <- MutationalPatterns::get_known_signatures(
+  muttype = "snv",
+  source = COSMIC_SOURCE,
+  genome = REFERENCE_GENOME
+)
+
+missing_signatures <- setdiff(SIGNATURE_PANEL, colnames(all_signatures))
+
+if (length(missing_signatures) > 0) {
+  stop(
+    "Required COSMIC signatures unavailable: ",
+    paste(missing_signatures, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+# 14. Signature fitting helper
+
+fit_signature_matrix <- function(mut_mat) {
+  signatures <- all_signatures[, SIGNATURE_PANEL, drop = FALSE]
+  
+  if (nrow(signatures) != 96 || nrow(mut_mat) != 96) {
+    stop("Signature and mutation matrices must both contain 96 contexts.", call. = FALSE)
+  }
+  
+  # MutationalPatterns uses the same canonical 96-context ordering for both
+  # matrices, but the package reference may use different row labels.
+  rownames(signatures) <- rownames(mut_mat)
+  
+  fit <- MutationalPatterns::fit_to_signatures_strict(
+    mut_matrix = mut_mat,
+    signatures = signatures,
+    max_delta = MAX_DELTA
+  )
+  
+  fitted_contrib <- fit$fit_res$contribution
+  
+  abs_contrib <- matrix(
+    0,
+    nrow = length(SIGNATURE_PANEL),
+    ncol = ncol(mut_mat),
+    dimnames = list(SIGNATURE_PANEL, colnames(mut_mat))
+  )
+  
+  common_signatures <- intersect(rownames(fitted_contrib), SIGNATURE_PANEL)
+  common_profiles <- intersect(colnames(fitted_contrib), colnames(mut_mat))
+  
+  abs_contrib[common_signatures, common_profiles] <-
+    fitted_contrib[common_signatures, common_profiles, drop = FALSE]
+  
+  totals <- colSums(abs_contrib)
+  rel_contrib <- sweep(abs_contrib, 2, totals, "/")
+  rel_contrib[, totals == 0] <- NA_real_
+  
+  reconstructed <- signatures %*% abs_contrib
+  
+  cosines <- vapply(seq_len(ncol(mut_mat)), function(i) {
+    cosine_similarity(mut_mat[, i], reconstructed[, i])
+  }, numeric(1))
+  
+  qc <- tibble::tibble(
+    profile_id = colnames(mut_mat),
+    n_snvs = colSums(mut_mat),
+    cosine_similarity = cosines
+  )
+  
+  list(
+    absolute = abs_contrib,
+    relative = rel_contrib,
+    reconstructed = reconstructed,
+    qc = qc
+  )
+}
+
+
+# 15. Fit patient-level and pooled spectra
+
+fit_patient <- fit_signature_matrix(mut_mat_patient)
+fit_pooled <- fit_signature_matrix(mut_mat_pooled)
+
+
+# 16. Patient-level contribution table
+
+patient_abs <- as.data.frame(t(fit_patient$absolute), check.names = FALSE) %>%
+  tibble::rownames_to_column("profile_id") %>%
+  tidyr::pivot_longer(
+    -profile_id,
+    names_to = "signature",
+    values_to = "absolute_contribution"
+  )
+
+patient_rel <- as.data.frame(t(fit_patient$relative), check.names = FALSE) %>%
+  tibble::rownames_to_column("profile_id") %>%
+  tidyr::pivot_longer(
+    -profile_id,
+    names_to = "signature",
+    values_to = "relative_contribution"
+  )
+
+patient_contributions <- patient_abs %>%
+  dplyr::left_join(patient_rel, by = c("profile_id", "signature")) %>%
+  dplyr::left_join(profile_meta, by = "profile_id") %>%
+  dplyr::left_join(
+    fit_patient$qc %>% dplyr::select(profile_id, cosine_similarity),
+    by = "profile_id"
+  ) %>%
+  dplyr::select(
+    patient,
+    classification,
+    n_snvs,
+    confidence,
+    cosine_similarity,
+    signature,
+    absolute_contribution,
+    relative_contribution
+  ) %>%
+  dplyr::arrange(patient, classification, signature)
+
+readr::write_tsv(
+  patient_contributions,
+  file.path(OUT_DIR, "cluster_signature_patient_class_contributions.tsv")
+)
+
+# 17. Pooled contribution table
+
+pooled_meta <- tibble::tibble(
+  profile_id = CLASS_LEVELS,
+  classification = CLASS_LEVELS,
+  n_snvs = as.integer(colSums(mut_mat_pooled))
+) %>%
+  dplyr::mutate(confidence = confidence_from_count(n_snvs))
+
+pooled_abs <- as.data.frame(t(fit_pooled$absolute), check.names = FALSE) %>%
+  tibble::rownames_to_column("profile_id") %>%
+  tidyr::pivot_longer(
+    -profile_id,
+    names_to = "signature",
+    values_to = "absolute_contribution"
+  )
+
+pooled_rel <- as.data.frame(t(fit_pooled$relative), check.names = FALSE) %>%
+  tibble::rownames_to_column("profile_id") %>%
+  tidyr::pivot_longer(
+    -profile_id,
+    names_to = "signature",
+    values_to = "relative_contribution"
+  )
+
+pooled_contributions <- pooled_abs %>%
+  dplyr::left_join(pooled_rel, by = c("profile_id", "signature")) %>%
+  dplyr::left_join(pooled_meta, by = "profile_id") %>%
+  dplyr::left_join(
+    fit_pooled$qc %>% dplyr::select(profile_id, cosine_similarity),
+    by = "profile_id"
+  ) %>%
+  dplyr::select(
+    classification,
+    n_snvs,
+    confidence,
+    cosine_similarity,
+    signature,
+    absolute_contribution,
+    relative_contribution
+  ) %>%
+  dplyr::arrange(classification, signature)
+
+readr::write_tsv(
+  pooled_contributions,
+  file.path(OUT_DIR, "cluster_signature_pooled_contributions.tsv")
+)
+
+
+# 18. Fit QC
+
+patient_qc <- profile_meta %>%
+  dplyr::left_join(
+    fit_patient$qc %>% dplyr::select(profile_id, cosine_similarity),
+    by = "profile_id"
+  ) %>%
+  dplyr::mutate(scope = "patient_class") %>%
+  dplyr::select(scope, profile_id, patient, classification, n_snvs, confidence, cosine_similarity)
+
+pooled_qc <- pooled_meta %>%
+  dplyr::left_join(
+    fit_pooled$qc %>% dplyr::select(profile_id, cosine_similarity),
+    by = "profile_id"
+  ) %>%
+  dplyr::mutate(
+    scope = "pooled",
+    patient = NA_character_
+  ) %>%
+  dplyr::select(scope, profile_id, patient, classification, n_snvs, confidence, cosine_similarity)
+
+fit_qc <- dplyr::bind_rows(patient_qc, pooled_qc)
+
+readr::write_tsv(
+  fit_qc,
+  file.path(OUT_DIR, "cluster_signature_fit_qc.tsv")
+)
+
+
+# 19. Predefined process-level contributions
+
+process_from_contributions <- function(df, scope) {
+  df %>%
+    dplyr::group_by(
+      dplyr::across(
+        dplyr::all_of(
+          intersect(
+            c("patient", "classification", "n_snvs", "confidence", "cosine_similarity"),
+            names(df)
+          )
+        )
+      )
+    ) %>%
+    dplyr::summarise(
+      age_related = if (all(is.na(relative_contribution))) {
+        NA_real_
+      } else {
+        sum(relative_contribution[signature %in% AGE_RELATED_SIGNATURES], na.rm = TRUE)
+      },
+      
+      APOBEC = if (all(is.na(relative_contribution))) {
+        NA_real_
+      } else {
+        sum(relative_contribution[signature %in% APOBEC_SIGNATURES], na.rm = TRUE)
+      },
+      
+      .groups = "drop"
+    ) %>%
+    tidyr::pivot_longer(
+      c(age_related, APOBEC),
+      names_to = "process",
+      values_to = "relative_contribution"
+    ) %>%
+    dplyr::mutate(scope = scope)
+}
+
+patient_process <- process_from_contributions(
+  patient_contributions,
+  "patient_class"
+)
+
+pooled_process <- process_from_contributions(
+  pooled_contributions,
+  "pooled"
+)
+
+process_contributions <- dplyr::bind_rows(
+  patient_process,
+  pooled_process
+)
+
+readr::write_tsv(
+  process_contributions,
+  file.path(OUT_DIR, "cluster_signature_process_contributions.tsv")
+)
+
+
+# 20. Paired Wilcoxon helper
+
+paired_wilcoxon <- function(df, measure_col, measure, class_a, class_b) {
+  sub <- df %>%
+    dplyr::filter(
+      .data[[measure_col]] == measure,
+      classification %in% c(class_a, class_b),
+      !is.na(relative_contribution)
+    ) %>%
+    dplyr::select(patient, classification, relative_contribution) %>%
+    tidyr::pivot_wider(
+      names_from = classification,
+      values_from = relative_contribution
+    ) %>%
+    dplyr::filter(
+      !is.na(.data[[class_a]]),
+      !is.na(.data[[class_b]])
+    )
+  
+  n_pairs <- nrow(sub)
+  
+  if (n_pairs == 0) {
+    return(tibble::tibble(
+      measure = measure,
+      comparison = paste(class_a, "vs", class_b),
+      n_pairs = 0L,
+      n_nonzero_pairs = 0L,
+      median_a = NA_real_,
+      median_b = NA_real_,
+      median_paired_difference = NA_real_,
+      n_a_higher = 0L,
+      n_b_higher = 0L,
+      n_equal = 0L,
+      statistic = NA_real_,
+      p_value = NA_real_,
+      note = "no paired patients"
+    ))
+  }
+  
+  x <- sub[[class_a]]
+  y <- sub[[class_b]]
+  difference <- x - y
+  
+  n_nonzero <- sum(difference != 0)
+  n_a_higher <- sum(difference > 0)
+  n_b_higher <- sum(difference < 0)
+  n_equal <- sum(difference == 0)
+  
+  if (n_nonzero == 0) {
+    statistic <- 0
+    p_value <- 1
+    note <- "all paired differences were zero"
+  } else {
+    fit <- suppressWarnings(
+      stats::wilcox.test(x, y, paired = TRUE, exact = FALSE)
+    )
+    
+    statistic <- unname(fit$statistic)
+    p_value <- fit$p.value
+    note <- NA_character_
+  }
+  
+  tibble::tibble(
+    measure = measure,
+    comparison = paste(class_a, "vs", class_b),
+    n_pairs = n_pairs,
+    n_nonzero_pairs = n_nonzero,
+    median_a = median(x),
+    median_b = median(y),
+    median_paired_difference = median(difference),
+    n_a_higher = n_a_higher,
+    n_b_higher = n_b_higher,
+    n_equal = n_equal,
+    statistic = statistic,
+    p_value = p_value,
+    note = note
+  )
+}
+
+# 21. Individual signature comparisons
+
+comparisons <- list(
+  c("shared", "tumor_specific"),
+  c("shared", "NAT_specific"),
+  c("tumor_specific", "NAT_specific")
+)
+
+individual_tests <- purrr::map_dfr(comparisons, function(cmp) {
+  purrr::map_dfr(SIGNATURE_PANEL, function(sig) {
+    paired_wilcoxon(
+      patient_contributions,
+      measure_col = "signature",
+      measure = sig,
+      class_a = cmp[1],
+      class_b = cmp[2]
+    )
+  })
+}) %>%
+  dplyr::group_by(comparison) %>%
+  dplyr::mutate(
+    p_adj_BH = p.adjust(p_value, method = "BH"),
+    significant_BH = !is.na(p_adj_BH) & p_adj_BH < 0.05
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(comparison, p_value)
+
+readr::write_tsv(
+  individual_tests,
+  file.path(OUT_DIR, "cluster_signature_individual_tests.tsv")
+)
+
+# 22. Process-level comparisons
+
+process_names <- c("age_related", "APOBEC")
+
+process_tests <- purrr::map_dfr(comparisons, function(cmp) {
+  purrr::map_dfr(process_names, function(process_name) {
+    paired_wilcoxon(
+      patient_process,
+      measure_col = "process",
+      measure = process_name,
+      class_a = cmp[1],
+      class_b = cmp[2]
+    )
+  })
+}) %>%
+  dplyr::group_by(comparison) %>%
+  dplyr::mutate(
+    p_adj_BH = p.adjust(p_value, method = "BH"),
+    significant_BH = !is.na(p_adj_BH) & p_adj_BH < 0.05
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(comparison, p_value)
+
+readr::write_tsv(
+  process_tests,
+  file.path(OUT_DIR, "cluster_signature_process_tests.tsv")
+)
+
+# 23. Analysis settings
+
+analysis_settings <- tibble::tribble(
+  ~parameter, ~value,
+  
+  "reference_genome",
+  "BSgenome.Hsapiens.UCSC.hg38",
+  
+  "COSMIC_reference",
+  COSMIC_SOURCE,
+  
+  "signature_fitting",
+  "MutationalPatterns::fit_to_signatures_strict",
+  
+  "max_delta",
+  as.character(MAX_DELTA),
+  
+  "signature_panel",
+  paste(SIGNATURE_PANEL, collapse = ";"),
+  
+  "age_related_process",
+  paste(AGE_RELATED_SIGNATURES, collapse = "+"),
+  
+  "APOBEC_process",
+  paste(APOBEC_SIGNATURES, collapse = "+"),
+  
+  "clonal_classes",
+  paste(CLASS_LEVELS, collapse = ";"),
+  
+  "minimum_SNVs_for_fitting",
+  "1",
+  
+  "confidence_high",
+  ">100 SNVs",
+  
+  "confidence_medium",
+  "50-100 SNVs",
+  
+  "confidence_low",
+  "1-49 SNVs",
+  
+  "cosine_similarity_filter",
+  "none; cosine similarity retained as QC",
+  
+  "cluster_confidence_filter",
+  "none; all classified clusters retained",
+  
+  "statistical_test",
+  "paired Wilcoxon signed-rank test",
+  
+  "individual_signature_multiple_testing",
+  "Benjamini-Hochberg across six signatures within each clonal-class comparison",
+  
+  "process_multiple_testing",
+  "Benjamini-Hochberg across age-related and APOBEC process scores within each clonal-class comparison"
+)
+
+readr::write_tsv(
+  analysis_settings,
+  file.path(OUT_DIR, "cluster_signature_analysis_settings.tsv")
+)
+
+
+# 24. Software versions
+
+writeLines(
+  c(
+    "Step 8: Mutational signatures in PyClone-VI clonal compartments",
+    "",
+    paste0("PyClone mutation results: ", PYCLONE_RESULTS),
+    paste0("PyClone cluster summary: ", CLUSTER_SUMMARY),
+    "",
+    "R session:",
+    capture.output(sessionInfo())
+  ),
+  file.path(OUT_DIR, "cluster_signature_software_versions.txt")
+)
+
+
+# 25. Final report
+
+cat("Patients analysed:", dplyr::n_distinct(muts$patient), "\n")
+cat("Classified mutations:", nrow(muts), "\n")
+cat("Patient x class spectra:", nrow(profile_meta), "\n")
+cat("Signature panel:", paste(SIGNATURE_PANEL, collapse = ", "), "\n")
+
+cat("\nPooled spectrum QC:\n")
+print(pooled_qc %>%
+    dplyr::select(classification, n_snvs, cosine_similarity))
+cat("\nIndividual signature tests written:", file.path(OUT_DIR, "cluster_signature_individual_tests.tsv"), "\n")
+cat("Process-level tests written:", file.path(OUT_DIR, "cluster_signature_process_tests.tsv"), "\n")
+cat("Output directory:", OUT_DIR, "\n")
+
